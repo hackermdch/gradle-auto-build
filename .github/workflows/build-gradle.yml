@@ -1,0 +1,188 @@
+name: Build external Gradle project
+run-name: Build ${{ inputs.repository_url }} @ ${{ inputs.git_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: 'HTTPS URL of the target Git repository'
+        required: true
+        type: string
+      git_ref:
+        description: 'Branch, tag, or full commit SHA; HEAD uses the default branch'
+        required: true
+        default: HEAD
+        type: string
+      project_dir:
+        description: 'Gradle project directory relative to the target repository root'
+        required: true
+        default: '.'
+        type: string
+      java_version:
+        description: 'JDK version, such as 8, 17, 21, or 25'
+        required: true
+        default: '21'
+        type: string
+      gradle_version:
+        description: 'Leave blank to use the project Wrapper, or specify a Gradle version'
+        required: false
+        type: string
+      gradle_arguments:
+        description: 'Gradle tasks and arguments; quotes are supported, e.g. clean build -x test'
+        required: true
+        default: 'clean build'
+        type: string
+      runner:
+        description: 'Operating system for the build'
+        required: true
+        default: ubuntu-latest
+        type: choice
+        options:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+      artifact_paths:
+        description: 'Artifact globs relative to the target repository root; separate with semicolons or newlines'
+        required: false
+        default: '**/build/libs/*.jar;**/build/distributions/*;**/build/outputs/**/*.apk;**/build/outputs/**/*.aab'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Fetch the target project directly without checking out the workflow repository.
+      - name: Fetch target repository
+        env:
+          TARGET_REPOSITORY: ${{ inputs.repository_url }}
+          TARGET_REF: ${{ inputs.git_ref }}
+          TARGET_GIT_TOKEN: ${{ secrets.TARGET_GIT_TOKEN }}
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          set -euo pipefail
+          host=$(python - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+
+          url = os.environ['TARGET_REPOSITORY']
+          parsed = urlsplit(url)
+          if parsed.scheme != 'https' or not parsed.hostname:
+              raise SystemExit('repository_url must be an HTTPS Git URL')
+          if parsed.username or parsed.password or any(c.isspace() for c in url):
+              raise SystemExit('Use a URL without credentials or whitespace')
+          print(parsed.hostname.lower())
+          PY
+          )
+          # Use an optional PAT for private GitHub repositories, scoped to this step's environment.
+          if [[ "$host" == 'github.com' && -n "$TARGET_GIT_TOKEN" ]]; then
+            authorization=$(python - <<'PY'
+          import base64
+          import os
+          print(base64.b64encode(('x-access-token:' + os.environ['TARGET_GIT_TOKEN']).encode()).decode())
+          PY
+            )
+            echo "::add-mask::$authorization"
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+            export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"
+          fi
+          git init target
+          git -C target remote add origin "$TARGET_REPOSITORY"
+          git -C target fetch --depth=1 origin -- "$TARGET_REF"
+          git -C target lfs install --local
+          git -C target checkout --detach FETCH_HEAD
+          git -C target submodule update --init --recursive --depth=1
+          commit=$(git -C target rev-parse HEAD)
+          {
+            echo '### Target source'
+            printf 'Commit: `%s`\n' "$commit"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # Leave blank to use the project Wrapper; otherwise install the specified version.
+          gradle-version: ${{ inputs.gradle_version }}
+
+      - name: Build
+        id: build
+        env:
+          PROJECT_DIR: ${{ inputs.project_dir }}
+          GRADLE_VERSION: ${{ inputs.gradle_version }}
+          GRADLE_ARGUMENTS: ${{ inputs.gradle_arguments }}
+          ARTIFACT_PATHS: ${{ inputs.artifact_paths }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath, PureWindowsPath
+          import shlex
+          import shutil
+          import subprocess
+          import uuid
+
+          root = Path('target').resolve()
+          project = (root / os.environ['PROJECT_DIR']).resolve()
+          if not project.is_relative_to(root) or not project.is_dir():
+              raise SystemExit('project_dir must be an existing directory inside the target repository')
+
+          # upload-artifact resolves paths relative to the workspace, not the Gradle project directory.
+          patterns = []
+          for line in os.environ['ARTIFACT_PATHS'].replace(';', '\n').splitlines():
+              pattern = line.strip().replace('\\', '/')
+              if not pattern:
+                  continue
+              exclude = pattern.startswith('!')
+              pattern = pattern[1:] if exclude else pattern
+              path = PurePosixPath(pattern)
+              if not pattern or path.is_absolute() or PureWindowsPath(pattern).drive or '..' in path.parts:
+                  raise SystemExit('artifact_paths must contain relative patterns inside the target repository')
+              patterns.append(('!' if exclude else '') + 'target/' + pattern)
+          if patterns:
+              delimiter = 'ARTIFACT_' + uuid.uuid4().hex
+              with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+                  output.write('artifact_paths<<' + delimiter + '\n')
+                  output.write('\n'.join(patterns) + '\n' + delimiter + '\n')
+
+          arguments = shlex.split(os.environ['GRADLE_ARGUMENTS'])
+          if not arguments:
+              raise SystemExit('gradle_arguments must contain at least one task')
+          if os.environ['GRADLE_VERSION'].strip():
+              executable = shutil.which('gradle')
+              if not executable:
+                  raise SystemExit('Gradle was not installed successfully')
+          else:
+              wrapper = project / ('gradlew.bat' if os.name == 'nt' else 'gradlew')
+              if not wrapper.is_file():
+                  raise SystemExit('Gradle Wrapper is missing; set gradle_version or correct project_dir')
+              if os.name != 'nt':
+                  wrapper.chmod(wrapper.stat().st_mode | 0o111)
+              executable = str(wrapper)
+          result = subprocess.run(
+              [executable, '--no-daemon', '--console=plain', '--stacktrace', *arguments],
+              cwd=project,
+          )
+          raise SystemExit(result.returncode)
+          PY
+
+      - name: Upload build artifacts
+        if: ${{ !cancelled() && steps.build.outputs.artifact_paths != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.build.outputs.artifact_paths }}
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
